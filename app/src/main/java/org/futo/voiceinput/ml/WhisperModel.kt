@@ -5,7 +5,10 @@ import android.content.Context
 import android.content.Intent
 import android.util.Log
 import kotlinx.coroutines.DelicateCoroutinesApi
+import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.newSingleThreadContext
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
@@ -73,6 +76,98 @@ fun loadGGMLModel(context: Context, model: ModelData, onPartialDecode: (String) 
     return WhisperGGML(modelBuffer, onPartialDecode)
 }
 
+/**
+ * Process-wide cache of loaded [WhisperGGML] models.
+ *
+ * Loading a model means memory-mapping the (up to gigabyte-sized) weights and paging them in during
+ * the first inference. When recognition runs back-to-back - the IME dictating repeatedly, or an app
+ * hammering the SpeechRecognizer - repeating that work each time is the dominant latency. This keeps
+ * the last-used models resident between sessions and only frees them once nothing has used them for
+ * [EVICTION_DELAY_MS], or on memory pressure via [evictAll].
+ */
+@OptIn(DelicateCoroutinesApi::class)
+object WhisperModelCache {
+    private const val EVICTION_DELAY_MS = 30_000L
+
+    private val lock = Any()
+    private val entries = HashMap<String, WhisperGGML>()
+    private var activeLeases = 0
+    private var evictionJob: Job? = null
+
+    private fun keyOf(model: ModelData): String =
+        (if (model.ggml.is_builtin_asset) "asset:" else "file:") + model.ggml.ggml_file
+
+    /**
+     * Returns a ready model for [model], reusing the cached instance when possible. Every successful
+     * call must be balanced by exactly one [release]. May block to load the model and may throw the
+     * same exceptions as [loadGGMLModel].
+     */
+    @Throws(IOException::class)
+    fun acquire(context: Context, model: ModelData, onPartialDecode: (String) -> Unit): WhisperGGML {
+        val key = keyOf(model)
+
+        synchronized(lock) {
+            evictionJob?.cancel()
+            evictionJob = null
+            activeLeases++
+
+            val cached = entries[key]
+            if (cached != null && cached.isOpen) {
+                cached.partialResultCallback = onPartialDecode
+                Log.i("WhisperModelCache", "hit $key (warm)")
+                return cached
+            }
+            entries.remove(key)
+        }
+
+        Log.i("WhisperModelCache", "miss $key (loading)")
+
+        val loaded = try {
+            loadGGMLModel(context, model, onPartialDecode)
+        } catch (e: Throwable) {
+            release()
+            throw e
+        }
+
+        synchronized(lock) {
+            val raced = entries[key]
+            if (raced != null && raced.isOpen) {
+                raced.partialResultCallback = onPartialDecode
+                GlobalScope.launch { runCatching { loaded.close() } }
+                return raced
+            }
+            entries[key] = loaded
+            return loaded
+        }
+    }
+
+    /** Balances one [acquire]. When the last lease is returned, schedules idle eviction. */
+    fun release() {
+        synchronized(lock) {
+            activeLeases = (activeLeases - 1).coerceAtLeast(0)
+            if (activeLeases == 0) {
+                evictionJob?.cancel()
+                evictionJob = GlobalScope.launch {
+                    delay(EVICTION_DELAY_MS)
+                    evictAll()
+                }
+            }
+        }
+    }
+
+    /** Frees every cached model now. Safe to call at any time (e.g. from onTrimMemory). */
+    fun evictAll() {
+        val toClose: List<WhisperGGML>
+        synchronized(lock) {
+            evictionJob?.cancel()
+            evictionJob = null
+            toClose = entries.values.toList()
+            entries.clear()
+        }
+        GlobalScope.launch { toClose.forEach { runCatching { it.close() } } }
+    }
+}
+
 private fun openMigrationIfModelIsLegacy(context: Context, model: ModelData) {
     if(listOf(
         model.legacy.encoder_xatn_file,
@@ -104,18 +199,18 @@ class WhisperModelWrapper(
     private var primaryModelGGML: WhisperGGML? = null
     private var fallbackModelGGML: WhisperGGML? = null
 
+    /** Number of outstanding [WhisperModelCache.acquire] calls this wrapper is responsible for. */
+    private var leasesHeld = 0
+
     init {
         if(primaryModel == fallbackEnglishModel) {
             throw IllegalArgumentException("Fallback model must be unique from the primary model")
         }
 
         try {
-            primaryModelGGML = loadGGMLModel(context, primaryModel, onPartialDecode)
+            primaryModelGGML = WhisperModelCache.acquire(context, primaryModel, onPartialDecode)
+            leasesHeld++
         } catch(e: Exception) {
-            runBlocking {
-                primaryModelGGML?.close()
-            }
-
             Log.e("WhisperModel", "Exception during loading primary ggml model: ${e.stackTraceToString()}")
             openMigrationIfModelIsLegacy(context, primaryModel)
             throw e
@@ -123,16 +218,22 @@ class WhisperModelWrapper(
 
         fallbackEnglishModel?.let { fallbackEnglishModel ->
             try {
-                fallbackModelGGML = loadGGMLModel(context, fallbackEnglishModel, onPartialDecode)
+                fallbackModelGGML = WhisperModelCache.acquire(context, fallbackEnglishModel, onPartialDecode)
+                leasesHeld++
             } catch(e: Exception) {
-                runBlocking {
-                    fallbackModelGGML?.close()
-                }
+                runBlocking { releaseLeases() }
 
                 Log.e("WhisperModel", "Exception during loading fallback ggml model: ${e.stackTraceToString()}")
                 openMigrationIfModelIsLegacy(context, fallbackEnglishModel)
                 throw e
             }
+        }
+    }
+
+    private fun releaseLeases() {
+        while (leasesHeld > 0) {
+            WhisperModelCache.release()
+            leasesHeld--
         }
     }
 
@@ -187,8 +288,15 @@ class WhisperModelWrapper(
         }
     }
 
-    suspend fun close() = withContext(inferenceContext) {
-        primaryModelGGML?.close()
-        fallbackModelGGML?.close()
+    /**
+     * Releases this wrapper's hold on the underlying models. By default they stay cached and warm
+     * for the next session ([WhisperModelCache]); pass [evict] to free the native memory now, e.g.
+     * when recovering from an [OutOfMemoryError].
+     */
+    suspend fun close(evict: Boolean = false) = withContext(inferenceContext) {
+        primaryModelGGML = null
+        fallbackModelGGML = null
+        releaseLeases()
+        if (evict) WhisperModelCache.evictAll()
     }
 }

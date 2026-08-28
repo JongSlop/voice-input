@@ -543,7 +543,7 @@ abstract class AudioRecognizer {
             model!!.run(floatArray, words, forcedLanguage, decodingMode)
         } catch(e: OutOfMemoryError) {
             decodingStatus(RunState.OOMError)
-            model!!.close()
+            model!!.close(evict = true)
             model = null
             loadModelJob = null
 

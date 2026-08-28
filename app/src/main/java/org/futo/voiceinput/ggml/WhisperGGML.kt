@@ -18,7 +18,11 @@ class BailLanguageException(val language: String): Exception()
 
 class WhisperGGML(
     modelBuffer: Buffer,
-    val partialResultCallback: (String) -> Unit
+    /**
+     * Mutable so a cached model instance can be re-pointed at the current session's listener
+     * instead of being reloaded from scratch. See [org.futo.voiceinput.ml.WhisperModelCache].
+     */
+    var partialResultCallback: (String) -> Unit
 ) {
     companion object {
         init {
@@ -27,6 +31,10 @@ class WhisperGGML(
     }
 
     private var handle: Long = 0L
+
+    val isOpen: Boolean
+        get() = handle != 0L
+
     init {
         handle = openFromBufferNative(modelBuffer)
 

@@ -176,6 +176,27 @@ class SpeechRecognizerServiceTest {
     }
 
     @Test
+    fun backToBackSessions_secondIsNotSlower_andReusesWarmModel() {
+        fun timedSession(): Long {
+            val start = System.currentTimeMillis()
+            val recorder = runSession { SpeechRecognizer.createSpeechRecognizer(context, component) }
+            val elapsed = System.currentTimeMillis() - start
+            assertHealthySession(recorder)
+            return elapsed
+        }
+
+        val first = timedSession()
+        val second = timedSession()
+        android.util.Log.i("SRTest", "session durations: first=${first}ms second=${second}ms")
+
+        // The warm session must not be meaningfully slower than the cold one.
+        assertTrue(
+            "second (warm) session $second ms was much slower than first (cold) $first ms",
+            second <= first + 1500
+        )
+    }
+
+    @Test
     fun checkRecognitionSupport_reportsEnglishInstalled() {
         val support = AtomicReference<RecognitionSupport?>()
         val error = AtomicReference<Int?>()

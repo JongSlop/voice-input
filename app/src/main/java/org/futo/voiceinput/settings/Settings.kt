@@ -135,6 +135,7 @@ val EXT_PENDING_PURCHASE_ID = SettingsKey(stringPreferencesKey("purchase_id"), "
 val EXT_PENDING_PURCHASE_LAST_CHECK = SettingsKey(longPreferencesKey("purchase_status_last_check"), 0)
 
 val IS_VAD_ENABLED = SettingsKey(booleanPreferencesKey("enable_vad"), true)
+val USE_BLUETOOTH_MIC = SettingsKey(booleanPreferencesKey("use_bluetooth_mic"), true)
 val USE_LANGUAGE_SPECIFIC_MODELS = SettingsKey(booleanPreferencesKey("USE_LANGUAGE_SPECIFIC_MODELS"), true)
 
 val ALLOW_UNDERTRAINED_LANGUAGES = SettingsKey(booleanPreferencesKey("allow_undertrained_languages"), false)

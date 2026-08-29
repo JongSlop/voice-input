@@ -38,8 +38,10 @@ import org.futo.voiceinput.settings.IS_VAD_ENABLED
 import org.futo.voiceinput.settings.LANGUAGE_TOGGLES
 import org.futo.voiceinput.settings.MULTILINGUAL_MODEL_INDEX
 import org.futo.voiceinput.settings.PERSONAL_DICTIONARY
+import org.futo.voiceinput.settings.USE_BLUETOOTH_MIC
 import org.futo.voiceinput.settings.USE_LANGUAGE_SPECIFIC_MODELS
 import org.futo.voiceinput.settings.getSetting
+import org.futo.voiceinput.settings.getSettingBlocking
 import java.io.IOException
 import java.nio.FloatBuffer
 import java.nio.ShortBuffer
@@ -56,8 +58,16 @@ enum class MagnitudeState {
 }
 
 abstract class AudioRecognizer {
+    private companion object {
+        const val BLUETOOTH_MIC_TIMEOUT_MS = 2500L
+    }
+
     private var isRecording = false
     private var recorder: AudioRecord? = null
+
+    private var bluetoothMic: BluetoothMicRouter? = null
+    private fun bluetoothMicRouter(): BluetoothMicRouter =
+        bluetoothMic ?: BluetoothMicRouter(context).also { bluetoothMic = it }
 
     fun isCurrentlyRecording(): Boolean {
         return isRecording
@@ -84,6 +94,7 @@ abstract class AudioRecognizer {
 
 
     protected abstract val context: Context
+    protected open val recordingContext: Context get() = context
     protected abstract val lifecycleScope: LifecycleCoroutineScope
 
     protected abstract fun cancelled()
@@ -129,6 +140,7 @@ abstract class AudioRecognizer {
         recorder?.stop()
         recorderJob?.cancel()
         modelJob?.cancel()
+        bluetoothMic?.deactivate()
         isRecording = false
 
         floatSamples.clear()
@@ -278,6 +290,8 @@ abstract class AudioRecognizer {
         forcedLanguage = language
     }
 
+    var extraBiasingWords: List<String> = emptyList()
+
     fun create() {
         loading()
 
@@ -304,13 +318,28 @@ abstract class AudioRecognizer {
         isVADPaused = false
 
         try {
-            recorder = AudioRecord(
-                MediaRecorder.AudioSource.VOICE_RECOGNITION,
-                16000,
-                AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT,
-                16000 * 2 * 5
-            )
+            recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                AudioRecord.Builder()
+                    .setContext(recordingContext)
+                    .setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION)
+                    .setAudioFormat(
+                        AudioFormat.Builder()
+                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                            .setSampleRate(16000)
+                            .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+                            .build()
+                    )
+                    .setBufferSizeInBytes(16000 * 2 * 5)
+                    .build()
+            } else {
+                AudioRecord(
+                    MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                    16000,
+                    AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                    16000 * 2 * 5
+                )
+            }
 
             if(recorder!!.state == AudioRecord.STATE_UNINITIALIZED) {
                 recorder!!.release()
@@ -339,6 +368,12 @@ abstract class AudioRecognizer {
             focusAudio()
             isRecording = true
 
+            // Only engage Bluetooth routing once we're actually recording, so a failed AudioRecord
+            // start can never leave the system stuck on the headset.
+            val bluetoothMicRequested =
+                context.getSettingBlocking(USE_BLUETOOTH_MIC.key, USE_BLUETOOTH_MIC.default) &&
+                    bluetoothMicRouter().activate()
+
             val canMicBeBlocked = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 (context.getSystemService(SensorPrivacyManager::class.java) as SensorPrivacyManager).supportsSensorToggle(
                     SensorPrivacyManager.Sensors.MICROPHONE
@@ -348,6 +383,21 @@ abstract class AudioRecognizer {
             }
 
             recorderJob = lifecycleScope.launch {
+                if (bluetoothMicRequested) {
+                    // The SCO / LE Audio link comes up asynchronously; switch the recorder over once
+                    // the mic actually appears, or give up and fall back to the built-in mic.
+                    launch {
+                        val btInput = bluetoothMic?.awaitInputDevice(BLUETOOTH_MIC_TIMEOUT_MS)
+                        if (btInput != null) {
+                            recorder?.setPreferredDevice(btInput)
+                        } else {
+                            println("Bluetooth mic did not connect in time, using built-in mic")
+                            bluetoothMic?.deactivate()
+                            recorder?.setPreferredDevice(null)
+                        }
+                    }
+                }
+
                 withContext(Dispatchers.Default) {
                     canExpandSpace = context.getSetting(ENABLE_30S_LIMIT) == false
 
@@ -496,6 +546,7 @@ abstract class AudioRecognizer {
             recordingStarted()
         } catch(e: SecurityException){
             // It's possible we may have lost permission, so let's just ask for permission again
+            bluetoothMic?.deactivate()
             needPermission()
         }
     }
@@ -512,7 +563,12 @@ abstract class AudioRecognizer {
 
         val floatArray = floatSamples.array().sliceArray(0 until floatSamples.position())
 
-        val words = context.getSetting(PERSONAL_DICTIONARY)
+        val personalDict = context.getSetting(PERSONAL_DICTIONARY)
+        val words = if (extraBiasingWords.isEmpty()) {
+            personalDict
+        } else {
+            (personalDict.lines().filter { it.isNotBlank() } + extraBiasingWords).joinToString("\n")
+        }
         val decodingMode = if(context.getSetting(BEAM_SEARCH)){ DecodingMode.BeamSearch5 } else { DecodingMode.Greedy }
 
         yield()
@@ -520,7 +576,7 @@ abstract class AudioRecognizer {
             model!!.run(floatArray, words, forcedLanguage, decodingMode)
         } catch(e: OutOfMemoryError) {
             decodingStatus(RunState.OOMError)
-            model!!.close()
+            model!!.close(evict = true)
             model = null
             loadModelJob = null
 
@@ -554,6 +610,7 @@ abstract class AudioRecognizer {
 
         recorderJob?.cancel()
         recorder?.stop()
+        bluetoothMic?.deactivate()
         unfocusAudio()
 
         processing()

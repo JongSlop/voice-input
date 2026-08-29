@@ -32,6 +32,7 @@ import org.futo.voiceinput.settings.ScrollableList
 import org.futo.voiceinput.settings.SettingToggleDataStore
 import org.futo.voiceinput.settings.SettingsViewModel
 import org.futo.voiceinput.settings.Tip
+import org.futo.voiceinput.settings.USE_BLUETOOTH_MIC
 import org.futo.voiceinput.settings.USE_LANGUAGE_SPECIFIC_MODELS
 import org.futo.voiceinput.settings.getSettingBlocking
 import org.futo.voiceinput.settings.useDataStore
@@ -65,6 +66,13 @@ fun InputScreen(
         SettingToggleDataStore(
             stringResource(R.string.animations),
             ENABLE_ANIMATIONS
+        )
+
+        SettingToggleDataStore(
+            stringResource(R.string.use_bluetooth_mic),
+            USE_BLUETOOTH_MIC,
+            subtitle = stringResource(R.string.use_bluetooth_mic_subtitle),
+            disabledSubtitle = stringResource(R.string.use_bluetooth_mic_disabled_subtitle)
         )
 
         Spacer(modifier = Modifier.height(32.dp))

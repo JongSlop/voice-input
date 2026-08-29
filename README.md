@@ -1,10 +1,24 @@
-# FUTO Voice Input
+# FUTO Voice Input (fork)
+
+> **This is a fork of [futo-org/voice-input](https://github.com/futo-org/voice-input).** It adds `SpeechRecognizer` API support, model caching, and Bluetooth microphone support on top of upstream — see [Fork changes](#fork-changes).
+>
+> **The fork changes were written by an AI coding agent (Claude Code).** They were reviewed and tested on-device by the fork maintainer, but are not otherwise human-authored. FUTO is not affiliated with this fork; report fork-specific issues here, not to FUTO.
 
 FUTO Voice Input is an application that lets you do speech-to-text on Android, integrating with third party keyboards or apps that use the generic speech-to-text APIs.
 
 To download the application, visit the [FUTO Voice Input page](https://voiceinput.futo.org/). You can also find the contact there to report issues or suggestions.
 
 If you have any feedback, issues are welcomed on the [public issue tracker](https://github.com/futo-org/voice-input/issues). Private inquiries are welcomed at the support email listed on the [website](https://voiceinput.futo.org/), or via the Send Feedback button in-app.
+
+## Fork changes
+
+Everything in this section is added by the fork. It builds on upstream and does not remove any existing functionality.
+
+* **`SpeechRecognizer` API support.** `SpeechRecognizer.createSpeechRecognizer(context)`, `createSpeechRecognizer(context, component)`, and `createOnDeviceSpeechRecognizer(context)` are served by `WhisperRecognizerService`, so apps that use the streaming recognition API (rather than the `RECOGNIZE_SPEECH` intent) work with FUTO. `RecognitionService.onCheckRecognitionSupport` is implemented and reports the installed and supported on-device languages. Started from [PR #154](https://github.com/futo-org/voice-input/pull/154) by @davecraig, then audited and completed — partial-result gating, `EXTRA_LANGUAGE` handling, `ERROR_NO_MATCH` on empty results.
+  * To use it as the system recognizer: set it under the system's assistant / voice-input settings, or `adb shell settings put secure voice_recognition_service org.futo.voiceinput/.WhisperRecognizerService`.
+  * `createOnDeviceSpeechRecognizer` additionally needs the OS to resolve this app as the on-device recognizer (a system config / RRO), which some ROMs (e.g. GrapheneOS) do not expose without root.
+* **Warm model cache.** Loaded Whisper models are kept resident between recognition sessions instead of being reloaded each time, and freed after a short idle period or on memory pressure. This mainly helps back-to-back use (repeated dictation, or an app driving the recognizer), and applies to both the keyboard and `SpeechRecognizer` paths.
+* **Bluetooth microphone.** A new *Use Bluetooth microphone* toggle (Input settings, on by default) routes capture to a connected Bluetooth SCO / LE Audio headset mic. Without this, Android keeps recognition on the built-in mic even while a headset is connected.
 
 ## Status
 
@@ -15,8 +29,9 @@ Development has largely shifted focus to the [FUTO Keyboard app](https://keyboar
 The following APIs are supported:
 * `android.speech.action.RECOGNIZE_SPEECH` implicit intent, for apps and some keyboards - this opens the floating window in the center of the screen
 * IME with `voice` subtype mode, for keyboards - this opens on the bottom half of the screen in place of the keyboard
+* `android.speech.SpeechRecognizer` (`RecognitionService`), for apps that use the streaming recognition API - **added by this fork**, see [Fork changes](#fork-changes)
 
-Currently this does not support the SpeechRecognizer API, which few apps seem to use. Support for this is planned in the future.
+Upstream does not support the `SpeechRecognizer` API (few apps use it, and support was only planned). This fork implements it.
 
 ## Keyboard support
 
